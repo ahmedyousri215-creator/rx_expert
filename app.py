@@ -66,8 +66,8 @@ st.divider()
 
 
 # (ضع مفتاحك هنا)
-os.environ["OPENAI_API_KEY"] = "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"
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+api_key = st.secrets.get("OPENAI_API_KEY")
+client = OpenAI(api_key=api_key)
 
 # إعداد ذاكرة التطبيق (عشان ما يعيدش التحميل مع كل سؤال)
 if "audit_done" not in st.session_state:
@@ -82,22 +82,18 @@ if "image_path" not in st.session_state:
     st.session_state.image_path = ""
 
 def fetch_high_evidence_pubmed(ingredient: str, synonym: str):
-    # --- التعديل هنا: إجبار PubMed على البحث عن الكلمة كـ "عبارة متطابقة" داخل العنوان فقط ---
     exact_ingredient = f'"{ingredient.strip()}"'
-    
     if synonym:
         exact_synonym = f'"{synonym.strip()}"'
         refined_query = f"({exact_ingredient}[Title] OR {exact_synonym}[Title])"
     else:
         refined_query = f"{exact_ingredient}[Title]"
         
-    raw_term = f"{refined_query} AND (\"meta-analysis\"[pt] OR \"systematic review\"[pt]) AND (\"last 10 years\"[dp])"
-    # -------------------------------------------------------------------------
-    
-    # باقي الكود هو المحرك بتاعك كما هو بالضبط:
+    raw_term = f'{refined_query} AND ("meta-analysis"[pt] OR "systematic review"[pt]) AND ("last 10 years"[dp])'
     encoded_term = urllib.parse.quote(raw_term)
     headers = {"User-Agent": "ClinicalAuditAgent/1.0"}
-    search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={encoded_term}&retmode=json&retmax=20&sort=relevance"
+    
+    search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={encoded_term}&retmode=json&retmax=50&sort=relevance"
     
     full_text_count = 0
     abstract_count = 0
@@ -114,11 +110,49 @@ def fetch_high_evidence_pubmed(ingredient: str, synonym: str):
         summary_res = requests.get(summary_url, headers=headers, timeout=15)
         summaries = summary_res.json().get("result", {}) if summary_res.status_code == 200 else {}
         
+        titles_list_str = ""
+        for pmid in pmids:
+            title = str(summaries.get(pmid, {}).get("title", "")).replace("&lt;", "<").replace("&gt;", ">")
+            if title:
+                titles_list_str += f"PMID: {pmid} | Title: {title}\n"
+                
+        status_text = st.empty()
+        status_text.text("🧠 جاري فرز العناوين واستبعاد الحالات الحرجة والنادرة...")
+        
+        triage_prompt = f"""
+        You are an expert OTC Clinical Pharmacist and Supplement Researcher.
+        Below is a list of systematic reviews/meta-analyses for the ingredient: '{ingredient}'.
+        
+        Your task: Select ONLY the PMIDs of studies that are relevant to normal human supplementation, general wellness, preventative health, fitness, or common outpatient conditions.
+        
+        STRICTLY REJECT any study focusing on:
+        - Acute hospital/ICU care (e.g., sepsis, surgery, burns, mechanical ventilation).
+        - Rare genetic/metabolic syndromes or neonatal intensive care.
+        - Oncology/cancer chemotherapy side-effects or dialysis.
+        
+        Return Maximum 15-20 best PMIDs as a comma-separated list of numbers only (e.g., 123456, 789012).
+        
+        Studies List:
+        {titles_list_str}
+        """
+        
+        # استدعاء الفلتر الذكي
+        triage_res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": triage_prompt}],
+            temperature=0.0
+        )
+        
+        selected_pmids_raw = triage_res.choices[0].message.content.strip()
+        filtered_pmids = [p.strip() for p in re.findall(r'\d+', selected_pmids_raw) if p.strip() in pmids]
+        
+        if not filtered_pmids:
+            filtered_pmids = pmids[:15]
+            
         compiled_studies = []
         progress_bar = st.progress(0)
-        status_text = st.empty()
         
-        for i, pmid in enumerate(pmids):
+        for i, pmid in enumerate(filtered_pmids):
             meta = summaries.get(pmid, {})
             title = str(meta.get("title", "No Title")).replace("&lt;", "<").replace("&gt;", ">")
             journal = meta.get("source", "Unknown Journal")
@@ -151,47 +185,111 @@ def fetch_high_evidence_pubmed(ingredient: str, synonym: str):
                     if pmc_res.status_code == 200 and "<body" in pmc_res.text:
                         body_match = re.search(r'<body.*?>(.*?)</body>', pmc_res.text, re.DOTALL)
                         raw_body = body_match.group(1) if body_match else pmc_res.text
-                        clean_body = re.sub(r'<[^>]+>', ' ', raw_body)
+                        
+                        clean_body = re.sub(r'</?(sec|title|p|tr|td|th)[^>]*>', '\n', raw_body)
+                        clean_body = re.sub(r'<[^>]+>', ' ', clean_body)
                         clean_body = re.sub(r'\s+', ' ', clean_body).strip()
-                        full_text_snippet = f"\n[FULL TEXT EXCERPT]:\n{clean_body[:12000]}\n"
+                        
+                        results_match = re.search(r'\b(3\.\s*Results|2\.\s*Results|Results and Discussion|Main Results|Subgroup Analysis|Discussion)\b', clean_body, re.IGNORECASE)
+                        
+                        if results_match and results_match.start() < len(clean_body) * 0.7:
+                            start_idx = results_match.start()
+                            extracted_core = clean_body[start_idx : start_idx + 20000]
+                        else:
+                            skip_intro = int(len(clean_body) * 0.20)
+                            extracted_core = clean_body[skip_intro : skip_intro + 20000]
+                            
+                        full_text_snippet = f"\n[🌟 HIGH-PRIORITY FULL TEXT (RESULTS & DISCUSSION & DOSING DETAILS)]:\n{extracted_core}\n"
                         is_full_text = True
                 except Exception:
                     pass
             
             if is_full_text:
                 full_text_count += 1
-                status_text.text(f"سحب النص الكامل: {title[:40]}...")
+                status_text.text(f"سحب النص الكامل ({i+1}/{len(filtered_pmids)}): {title[:40]}...")
             else:
                 abstract_count += 1
-                status_text.text(f"سحب الملخص: {title[:40]}...")
+                status_text.text(f"سحب الملخص ({i+1}/{len(filtered_pmids)}): {title[:40]}...")
 
             compiled_studies.append(f"{header_info}\n[ABSTRACT]:\n{abs_text}\n{full_text_snippet}\n")
-            progress_bar.progress((i + 1) / len(pmids))
+            progress_bar.progress((i + 1) / len(filtered_pmids))
             time.sleep(0.3)
             
-        stats_header = f"=== EXTRACTION STATISTICS ===\nTotal Studies Analyzed: {len(pmids)} | Full Text Extracted: {full_text_count} | Abstracts Only: {abstract_count}\n\n"
-        status_text.text("✅ تم سحب الأبحاث بنجاح!")
+        stats_header = f"=== EXTRACTION STATISTICS ===\nTotal Studies Analyzed: {len(filtered_pmids)} (Filtered from {len(pmids)} candidates) | Full Text Extracted: {full_text_count} | Abstracts Only: {abstract_count}\n\n"
+        status_text.text("✅ تم فرز وسحب الأبحاث الإكلينيكية بنجاح!")
         return stats_header + "".join(compiled_studies), full_text_count, abstract_count
     except Exception as e:
         return f"ERROR: {str(e)}", 0, 0
     
+    
 
 def generate_commercial_clinical_report(ingredient: str, studies_data: str, ft_count: int, abs_count: int) -> str:
     system_prompt = f"""
-    You are an Elite Clinical Pharmacologist. Write an EXHAUSTIVE, HIGH-DENSITY, GRANULAR Clinical Audit based STRICTLY on the retrieved Systematic Reviews ({ft_count} Full Texts, {abs_count} Abstracts).
-    1. FORBIDDEN VAGUE SUMMARIES: Never write lazy statements like "improves immunity".
-    2. THE 4-GEAR RULE: Every claim MUST state: [Specific Indication] + [Route & Chemical Form] + [Exact Dosage & Duration] + [Magnitude of Effect/Stats].
-    3. GRANULAR SYNTHESIS: Group by body system but preserve all distinct nuances.
-    Structure:
-    1. HIGH-EVIDENCE SOURCE REPOSITORY (List ALL studies with exact Titles & Links).
-    2. CLAIMS DEBUNKING & TRUE MAGNITUDE OF EFFECT (ACROSS DIVERSE BODY SYSTEMS).
-    3. CHEMICAL FORMS, BIOAVAILABILITY, & SYNERGIES.
-    4. EXACT CLINICAL PROTOCOLS (DOSAGE & TIMELINE).
-    5. TARGET DEMOGRAPHICS (WHO BENEFITS VS. WHO DOESN'T).
+    You are a Senior Clinical Pharmacologist and Evidence-Based Medicine (EBM) Methodologist. 
+    Your task is to author an authoritative, deeply analytical, and exhaustive **Clinical & Pharmacological Monograph** for ({ingredient}), grounded in the retrieved Systematic Reviews and Meta-Analyses ({ft_count} Deep Full-Text Excerpts, {abs_count} Abstracts).
+
+    ### CORE ANALYTICAL MANDATES:
+    1. **DEEP FULL-TEXT MINING (CRITICAL):** Studies marked with `[🌟 HIGH-PRIORITY FULL TEXT]` contain raw Results, Subgroup Analyses, and Discussion sections. You MUST aggressively mine these sections to extract:
+       - *Subgroup nuances:* Why did trials succeed in specific cohorts and fail in others? (e.g., baseline deficiency vs. sufficiency, age, comorbidities, duration thresholds).
+       - *Heterogeneity & Study Quality:* Extract $I^2$ values, confidence intervals (95% CI), p-values, and risk-of-bias notes whenever present.
+       - *Mechanistic & Kinetic explanations:* How the authors explain null results, ceiling effects, or bioavailability limits.
+    2. **STATISTICAL VS. CLINICAL SIGNIFICANCE:** Never blindly celebrate a p-value < 0.05. Explicitly judge whether the magnitude of effect (SMD, WMD, RR, OR, or absolute unit change) translates to meaningful real-world clinical benefit or trivial noise.
+    3. **THE 4-GEAR RULE FOR EFFICACY:** Every clinical claim MUST specify: [Exact Clinical Indication] + [Chemical Form & Route] + [Dose Range & Duration Threshold] + [Exact Magnitude of Effect / Statistical Reality].
+    4. **NO SHALLOW SUMMARIES:** Write with rigorous clinical depth. Explain the *Why* and *How* behind every conclusion.
+
+    ---
+
+    ### REQUIRED MONOGRAPH STRUCTURE:
+
+    ## 1. BIOCHEMICAL & PHYSIOLOGICAL PROFILE (بروفايل المادة الفعالة)
+    - **Endogenous vs. Essential Status:** Is ({ingredient}) synthesized endogenously by the human body (and under what rate-limiting pathways/organs), or is it strictly an essential exogenous nutrient/phytochemical?
+    - **Core Physiological Architecture:** Its primary biochemical mechanisms, enzymatic co-factor roles, or receptor targets in human physiology.
+    - **Epidemiology of Deficiency & Insufficiency:** How prevalent is clinical deficiency or subclinical insufficiency in the general population vs. specific high-risk subpopulations (based on the studies and established clinical knowledge)? What are the physiological consequences of depletion?
+    - **Homeostasis & Saturation Kinetics:** Does the body tightly regulate its blood/tissue levels (e.g., saturable active transport, renal threshold/excretion of excess), or does it accumulate?
+
+    ## 2. MACRO RESEARCH LANDSCAPE & TRAJECTORY (البانوراما البحثية وعلاقة الدراسات ببعضها)
+    - **The Big Picture:** Synthesize how the retrieved systematic reviews relate to one another. Are researchers converging on a single primary clinical cluster (e.g., metabolic health, immunity), or is the research fragmented across disparate organ systems?
+    - **Consensus vs. Controversy:** Identify where the meta-analyses show unified, reproducible agreement versus areas plagued by high heterogeneity ($I^2$) and conflicting outcomes.
+    - **Evolution of Evidence:** Note if newer reviews or full-text subgroup analyses overturn older assumptions about ({ingredient}).
+
+    ## 3. THE CORE EFFICACY MATRIX: CLAIMS, FACTS & WHY CLAIMS FAIL (مصفوفة الفعالية: الحقيقة مقابل الادعاء)
+    *(This is the heart of the audit. Divide strictly into three analytical tiers and apply the 4-Gear Rule)*:
+    - **Tier A — Proven Clinical Efficacy (أين تنجح المادة فعلياً وبقوة دليل عالية):** Detail the exact indications where ({ingredient}) produces both statistically and clinically meaningful outcomes. State exact effect sizes, doses, and required durations.
+    - **Tier B — Conditional or Context-Dependent Efficacy (فعالية مشروطة بظروف محددة):** Indications where the ingredient ONLY works under strict conditions (e.g., *only* in baseline-deficient patients, *only* above a specific dose threshold, or *only* in high-stress/athletic/elderly cohorts).
+    - **Tier C — Debunked, Overhyped, or Null Claims & THE ROOT CAUSE OF FAILURE (الادعاءات الفاشلة ولماذا لا تعمل):** List popular or tested uses where meta-analyses show null, negligible, or clinically meaningless effects. **Crucially, explain WHY these claims fail** based on the Full-Text Discussions (e.g., physiological ceiling effect in already-sufficient subjects, poor oral bioavailability, rapid renal clearance, short trial durations, or confounding variables).
+
+    ## 4. CHEMICAL FORMS, BIOAVAILABILITY & SYNERGIES (الصيغ الكيميائية والامتصاص)
+    - Compare all chemical forms, salts, derivatives, or delivery systems mentioned in the data (e.g., standard vs. chelated, active coenzyme forms, liposomal, sustained-release).
+    - Detail absorption bottlenecks, saturable dose limits (how much can be absorbed in a single sitting), and clinically proven synergies or antagonists.
+
+    ## 5. CLINICAL PROTOCOLS, TARGET DEMOGRAPHICS & SAFETY (البروتوكولات، الفئات المستهدفة، والأمان)
+    - **Precision Dosing Matrix:** Breakdown of exact daily dosages, splitting schedules, and minimum timeline to clinical response per indication.
+    - **Responder vs. Non-Responder Profile:** Who genuinely needs and benefits from supplementation vs. who will experience zero clinical return?
+    - **Tolerability, Adverse Events & Contraindications:** Specific GI, renal, metabolic, or drug-interaction risks reported in the trials, along with Upper Tolerable Intake Levels (UL).
+
+    ## 6. HIGH-EVIDENCE SOURCE REPOSITORY (فهرس المصادر الإكلينيكية)
+    - List ALL analyzed studies cleanly at the very end, formatted with Study #, Exact Title, Journal, Year, Type ([Full-Text Analyzed] vs. [Abstract Analyzed]), and Direct PubMed Link.
     """
-    user_prompt = f"Conduct an exhaustive, granular clinical audit for: ({ingredient}). Extract every number, dosage, and nuance.\n\nStudies Data:\n{studies_data}"
-    response = client.chat.completions.create(model="gpt-4o", temperature=0.15, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
+
+    user_prompt = f"""
+    Execute an exhaustive, publication-grade Clinical & Pharmacological Monograph for: ({ingredient}).
+    Strictly follow the 6-section architecture. Mine the [🌟 HIGH-PRIORITY FULL TEXT] sections deeply for subgroup analyses, $I^2$ heterogeneity, dosing thresholds, and the exact physiological/methodological reasons why certain claims succeed or fail.
+
+    Retrieved Clinical Studies Data:
+    {studies_data}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.1, # تقليل العشوائية لأقصى درجة لضمان الصرامة العلمية والأرقام الدقيقة
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    )
     return response.choices[0].message.content
+
+
 
 def generate_arabic_infographic_report(english_report: str, ingredient: str, ft_count: int, abs_count: int) -> str:
     total_studies = ft_count + abs_count
@@ -209,7 +307,7 @@ def generate_arabic_infographic_report(english_report: str, ingredient: str, ft_
     <b>Scientific References:</b><br>
     - [Titles and Links]
     </div>
-    """
+"""
     user_prompt = f"حوّل التقرير لمادة ({ingredient}) لإنفوجراف دسم:\n\n{english_report}"
     response = client.chat.completions.create(model="gpt-4o", temperature=0.15, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
     clean_output = re.sub(r'^```(markdown|html)?\n', '', response.choices[0].message.content)
